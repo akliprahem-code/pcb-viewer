@@ -87,3 +87,4 @@ The PCBViewer component accepts these props:
 - DRC (Design Rule Check) visualization
 - Measurement tools
 // fix #163
+Fixes #163
