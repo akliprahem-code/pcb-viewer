@@ -1,0 +1,711 @@
+import { zIndexMap } from "lib/util/z-index-map"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import type { Matrix } from "transformation-matrix"
+import { applyToPoint, identity, inverse } from "transformation-matrix"
+import type { Primitive } from "lib/types"
+import type { NinePointAnchor } from "circuit-json"
+import {
+  getPrimitiveBoundingBox,
+  mergeBoundingBoxes,
+} from "lib/util/get-primitive-bounding-box"
+import type { BoundingBox } from "lib/util/get-primitive-bounding-box"
+import { useDiagonalLabel } from "hooks/useDiagonalLabel"
+import { getPrimitiveSnapPoints } from "lib/util/get-primitive-snap-points"
+import { useGlobalStore } from "../global-store"
+
+interface Props {
+  transform?: Matrix
+  children: any
+  focusOnHover?: boolean
+  primitives?: Primitive[]
+  onBoundsSelected?: (bounds: BoundsSelection) => void
+  cancelPanDrag?: () => void
+}
+
+const SNAP_THRESHOLD_PX = 16
+const SNAP_MARKER_SIZE = 5
+
+export interface BoundsSelection {
+  minX: number
+  minY: number
+  maxX: number
+  maxY: number
+}
+
+const shouldExcludePrimitiveFromSnapping = (primitive: Primitive) => {
+  if (primitive.pcb_drawing_type === "text") return true
+
+  const element = primitive._element as { type?: unknown } | undefined
+  if (!element || typeof element !== "object") {
+    return false
+  }
+
+  const elementType =
+    typeof element.type === "string" ? (element.type as string) : undefined
+
+  if (!elementType) return false
+
+  if (elementType.startsWith("pcb_silkscreen_")) return true
+  if (elementType.startsWith("pcb_note_")) return true
+  if (elementType === "pcb_text") return true
+  if (
+    elementType.startsWith("pcb_fabrication_note_") &&
+    elementType !== "pcb_fabrication_note_rect"
+  ) {
+    return true
+  }
+
+  return false
+}
+
+export const DimensionOverlay = ({
+  children,
+  transform,
+  focusOnHover = false,
+  primitives = [],
+  onBoundsSelected,
+  cancelPanDrag,
+}: Props) => {
+  if (!transform) transform = identity()
+  const [dimensionToolVisible, setDimensionToolVisible] = useState(false)
+  const [dimensionToolStretching, setDimensionToolStretching] = useState(false)
+  const [measureToolArmed, setMeasureToolArmed] = useState(false)
+  const [boundsToolArmed, setBoundsToolArmed] = useState(false)
+  const [boundsToolVisible, setBoundsToolVisible] = useState(false)
+  const [boundsToolDragging, setBoundsToolDragging] = useState(false)
+  const [activeSnapIds, setActiveSnapIds] = useState({
+    start: null as string | null,
+    end: null as string | null,
+  })
+
+  const isMouseOverContainer = useGlobalStore((s) => s.is_mouse_over_container)
+
+  const disarmMeasure = useCallback(() => {
+    if (measureToolArmed) {
+      setMeasureToolArmed(false)
+      window.dispatchEvent(new Event("disarm-dimension-tool"))
+    }
+  }, [measureToolArmed])
+  const disarmBounds = useCallback(() => {
+    if (boundsToolArmed) {
+      setBoundsToolArmed(false)
+      window.dispatchEvent(new Event("disarm-bounds-tool"))
+    }
+  }, [boundsToolArmed])
+  // Start of dimension tool line in real-world coordinates (not screen)
+  const [dStart, setDStart] = useState({ x: 0, y: 0 })
+  // End of dimension tool line in real-world coordinates (not screen)
+  const [dEnd, setDEnd] = useState({ x: 0, y: 0 })
+  const [boundsStart, setBoundsStart] = useState({ x: 0, y: 0 })
+  const [boundsEnd, setBoundsEnd] = useState({ x: 0, y: 0 })
+  const mousePosRef = useRef({ x: 0, y: 0 })
+  const containerRef = useRef<HTMLDivElement | null>(null)
+  const container = containerRef.current!
+  const containerBounds = container?.getBoundingClientRect()
+
+  const elementBoundingBoxes = useMemo(() => {
+    const boundingBoxes = new Map<object, BoundingBox>()
+
+    for (const primitive of primitives) {
+      if (!primitive._element) continue
+      if (shouldExcludePrimitiveFromSnapping(primitive)) continue
+      if (primitive.pcb_drawing_type === "pill") continue
+      if (
+        primitive.pcb_drawing_type === "rect" &&
+        primitive.ccw_rotation &&
+        primitive.ccw_rotation !== 0
+      )
+        continue
+      const bbox = getPrimitiveBoundingBox(primitive)
+      if (!bbox) continue
+
+      const existing = boundingBoxes.get(primitive._element as object)
+      boundingBoxes.set(
+        primitive._element as object,
+        mergeBoundingBoxes(existing ?? undefined, bbox),
+      )
+    }
+
+    return boundingBoxes
+  }, [primitives])
+
+  const primitiveSnappingPoints = useMemo(() => {
+    const snapPoints: {
+      anchor: NinePointAnchor | string
+      point: { x: number; y: number }
+      element: object
+    }[] = []
+
+    for (const primitive of primitives) {
+      if (!primitive._element) continue
+      if (shouldExcludePrimitiveFromSnapping(primitive)) continue
+
+      const primitivePoints = getPrimitiveSnapPoints(primitive)
+      if (primitivePoints.length === 0) continue
+
+      for (const snap of primitivePoints) {
+        snapPoints.push({
+          anchor: snap.anchor,
+          point: snap.point,
+          element: primitive._element as object,
+        })
+      }
+    }
+
+    return snapPoints
+  }, [primitives])
+
+  const snappingPoints = useMemo(() => {
+    const points: {
+      anchor: NinePointAnchor | "origin" | string
+      point: { x: number; y: number }
+      element: object | null
+    }[] = []
+
+    elementBoundingBoxes.forEach((bounds, element) => {
+      if (!bounds) return
+
+      const centerX = (bounds.minX + bounds.maxX) / 2
+      const centerY = (bounds.minY + bounds.maxY) / 2
+
+      const anchorPoints: Record<NinePointAnchor, { x: number; y: number }> = {
+        top_left: { x: bounds.minX, y: bounds.minY },
+        top_center: { x: centerX, y: bounds.minY },
+        top_right: { x: bounds.maxX, y: bounds.minY },
+        center_left: { x: bounds.minX, y: centerY },
+        center: { x: centerX, y: centerY },
+        center_right: { x: bounds.maxX, y: centerY },
+        bottom_left: { x: bounds.minX, y: bounds.maxY },
+        bottom_center: { x: centerX, y: bounds.maxY },
+        bottom_right: { x: bounds.maxX, y: bounds.maxY },
+      }
+
+      for (const [anchor, point] of Object.entries(anchorPoints) as [
+        NinePointAnchor,
+        { x: number; y: number },
+      ][]) {
+        points.push({
+          anchor,
+          point,
+          element,
+        })
+      }
+    })
+
+    for (const snap of primitiveSnappingPoints) {
+      points.push(snap)
+    }
+
+    points.push({
+      anchor: "origin",
+      point: { x: 0, y: 0 },
+      element: null,
+    })
+
+    return points
+  }, [elementBoundingBoxes, primitiveSnappingPoints])
+
+  const snappingPointsWithScreen = useMemo(() => {
+    return snappingPoints.map((snap, index) => ({
+      ...snap,
+      id: `${index}-${snap.anchor}`,
+      screenPoint: applyToPoint(transform!, snap.point),
+    }))
+  }, [snappingPoints, transform])
+
+  const findSnap = useCallback(
+    (rwPoint: { x: number; y: number }) => {
+      if (snappingPointsWithScreen.length === 0) {
+        return { point: rwPoint, id: null as string | null }
+      }
+
+      const screenPoint = applyToPoint(transform!, rwPoint)
+      let bestMatch: {
+        distance: number
+        id: string
+        point: { x: number; y: number }
+      } | null = null
+
+      for (const snap of snappingPointsWithScreen) {
+        const dx = snap.screenPoint.x - screenPoint.x
+        const dy = snap.screenPoint.y - screenPoint.y
+        const distance = Math.hypot(dx, dy)
+
+        if (distance > SNAP_THRESHOLD_PX) continue
+        if (!bestMatch || distance < bestMatch.distance) {
+          bestMatch = {
+            distance,
+            id: snap.id,
+            point: snap.point,
+          }
+        }
+      }
+
+      if (!bestMatch) {
+        return { point: rwPoint, id: null as string | null }
+      }
+
+      return { point: bestMatch.point, id: bestMatch.id }
+    },
+    [snappingPointsWithScreen, transform],
+  )
+
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement
+      if (
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.isContentEditable
+      ) {
+        return
+      }
+
+      const containerHasFocus =
+        containerRef.current?.contains(document.activeElement) ||
+        document.activeElement === containerRef.current
+      if (!isMouseOverContainer && !containerHasFocus) return
+
+      if (e.key === "d") {
+        const snap = findSnap({
+          x: mousePosRef.current.x,
+          y: mousePosRef.current.y,
+        })
+
+        setDStart({ x: snap.point.x, y: snap.point.y })
+        setDEnd({ x: snap.point.x, y: snap.point.y })
+        setActiveSnapIds({ start: snap.id, end: snap.id })
+
+        if (dimensionToolVisible) {
+          setDimensionToolVisible(false)
+          setDimensionToolStretching(false)
+          setActiveSnapIds({ start: null, end: null })
+        } else {
+          setDimensionToolVisible(true)
+          setDimensionToolStretching(true)
+        }
+        disarmMeasure()
+      }
+      if (e.key === "Escape") {
+        setDimensionToolVisible(false)
+        setDimensionToolStretching(false)
+        setActiveSnapIds({ start: null, end: null })
+        setBoundsToolVisible(false)
+        setBoundsToolDragging(false)
+        disarmMeasure()
+        disarmBounds()
+      }
+    }
+
+    const armMeasure = () => {
+      setMeasureToolArmed(true)
+      setBoundsToolArmed(false)
+      window.dispatchEvent(new Event("disarm-bounds-tool"))
+    }
+
+    const armBounds = () => {
+      setBoundsToolArmed(true)
+      setMeasureToolArmed(false)
+      setDimensionToolVisible(false)
+      setDimensionToolStretching(false)
+      window.dispatchEvent(new Event("disarm-dimension-tool"))
+    }
+
+    window.addEventListener("keydown", down)
+    window.addEventListener("arm-dimension-tool", armMeasure)
+    window.addEventListener("arm-bounds-tool", armBounds)
+
+    return () => {
+      window.removeEventListener("keydown", down)
+      window.removeEventListener("arm-dimension-tool", armMeasure)
+      window.removeEventListener("arm-bounds-tool", armBounds)
+      disarmMeasure()
+      disarmBounds()
+    }
+  }, [
+    isMouseOverContainer,
+    dimensionToolVisible,
+    disarmMeasure,
+    disarmBounds,
+    findSnap,
+  ])
+
+  const screenDStart = applyToPoint(transform, dStart)
+  const screenDEnd = applyToPoint(transform, dEnd)
+  const screenBoundsStart = applyToPoint(transform, boundsStart)
+  const screenBoundsEnd = applyToPoint(transform, boundsEnd)
+
+  const selectedBounds = {
+    minX: Math.min(boundsStart.x, boundsEnd.x),
+    minY: Math.min(boundsStart.y, boundsEnd.y),
+    maxX: Math.max(boundsStart.x, boundsEnd.x),
+    maxY: Math.max(boundsStart.y, boundsEnd.y),
+  }
+
+  const boundsScreenRect = {
+    left: Math.min(screenBoundsStart.x, screenBoundsEnd.x),
+    top: Math.min(screenBoundsStart.y, screenBoundsEnd.y),
+    width: Math.abs(screenBoundsStart.x - screenBoundsEnd.x),
+    height: Math.abs(screenBoundsStart.y - screenBoundsEnd.y),
+  }
+
+  const emitBounds = useCallback(
+    (start: { x: number; y: number }, end: { x: number; y: number }) => {
+      const bounds = {
+        minX: Math.min(start.x, end.x),
+        minY: Math.min(start.y, end.y),
+        maxX: Math.max(start.x, end.x),
+        maxY: Math.max(start.y, end.y),
+      }
+
+      onBoundsSelected?.(bounds)
+      window.dispatchEvent(
+        new CustomEvent("pcb-viewer:bounds-selected", {
+          detail: bounds,
+        }),
+      )
+    },
+    [onBoundsSelected],
+  )
+
+  const arrowScreenBounds = {
+    left: Math.min(screenDStart.x, screenDEnd.x),
+    right: Math.max(screenDStart.x, screenDEnd.x),
+    top: Math.min(screenDStart.y, screenDEnd.y),
+    bottom: Math.max(screenDStart.y, screenDEnd.y),
+    flipX: screenDStart.x > screenDEnd.x,
+    flipY: screenDStart.y > screenDEnd.y,
+    width: 0,
+    height: 0,
+  }
+  arrowScreenBounds.width = arrowScreenBounds.right - arrowScreenBounds.left
+  arrowScreenBounds.height = arrowScreenBounds.bottom - arrowScreenBounds.top
+
+  const diagonalLabel = useDiagonalLabel({
+    dimensionStart: dStart,
+    dimensionEnd: dEnd,
+    screenDimensionStart: screenDStart,
+    screenDimensionEnd: screenDEnd,
+    flipX: arrowScreenBounds.flipX,
+    flipY: arrowScreenBounds.flipY,
+  })
+
+  return (
+    <div
+      ref={containerRef}
+      data-pcb-viewer
+      // biome-ignore lint/a11y/noNoninteractiveTabindex: <explanation>
+      tabIndex={0}
+      style={{ position: "relative", outline: "none" }}
+      onMouseEnter={() => {
+        if (focusOnHover && containerRef.current) {
+          containerRef.current.focus()
+        }
+      }}
+      onMouseLeave={() => {
+        if (containerRef.current) {
+          containerRef.current.blur()
+        }
+      }}
+      onClick={() => {
+        if (containerRef.current) {
+          containerRef.current.focus()
+        }
+      }}
+      onMouseMove={(e: React.MouseEvent<HTMLDivElement>) => {
+        const rect = e.currentTarget.getBoundingClientRect()
+        const x = e.clientX - rect.left
+        const y = e.clientY - rect.top
+        const rwPoint = applyToPoint(inverse(transform!), { x, y })
+        mousePosRef.current.x = rwPoint.x
+        mousePosRef.current.y = rwPoint.y
+
+        if (dimensionToolStretching) {
+          const snap = findSnap(rwPoint)
+          setDEnd({ x: snap.point.x, y: snap.point.y })
+          setActiveSnapIds((prev) => ({ ...prev, end: snap.id }))
+        }
+        if (boundsToolDragging) {
+          cancelPanDrag?.()
+          setBoundsEnd({ x: rwPoint.x, y: rwPoint.y })
+        }
+      }}
+      onMouseDown={(e) => {
+        const rect = e.currentTarget.getBoundingClientRect()
+        const x = e.clientX - rect.left
+        const y = e.clientY - rect.top
+        const rwPoint = applyToPoint(inverse(transform!), { x, y })
+
+        if (boundsToolArmed) {
+          e.preventDefault()
+          e.stopPropagation()
+          cancelPanDrag?.()
+          setBoundsStart({ x: rwPoint.x, y: rwPoint.y })
+          setBoundsEnd({ x: rwPoint.x, y: rwPoint.y })
+          setBoundsToolVisible(true)
+          setBoundsToolDragging(true)
+          disarmBounds()
+        } else if (measureToolArmed && !dimensionToolVisible) {
+          const snap = findSnap(rwPoint)
+          setDStart({ x: snap.point.x, y: snap.point.y })
+          setDEnd({ x: snap.point.x, y: snap.point.y })
+          setActiveSnapIds({ start: snap.id, end: snap.id })
+          setDimensionToolVisible(true)
+          setDimensionToolStretching(true)
+          disarmMeasure()
+        } else if (dimensionToolStretching) {
+          setDimensionToolStretching(false)
+          setActiveSnapIds((prev) => ({ ...prev, end: null }))
+        } else if (dimensionToolVisible) {
+          setDimensionToolVisible(false)
+          setActiveSnapIds({ start: null, end: null })
+        }
+      }}
+      onMouseUp={(e) => {
+        if (!boundsToolDragging) return
+
+        const rect = e.currentTarget.getBoundingClientRect()
+        const x = e.clientX - rect.left
+        const y = e.clientY - rect.top
+        const rwPoint = applyToPoint(inverse(transform!), { x, y })
+        const end = { x: rwPoint.x, y: rwPoint.y }
+
+        e.preventDefault()
+        e.stopPropagation()
+        cancelPanDrag?.()
+        setBoundsEnd(end)
+        setBoundsToolDragging(false)
+        emitBounds(boundsStart, end)
+      }}
+    >
+      {children}
+      {boundsToolVisible && (
+        <>
+          {/* biome-ignore lint/a11y/noSvgWithoutTitle: <explanation> */}
+          <svg
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 0,
+              pointerEvents: "none",
+              mixBlendMode: "difference",
+              zIndex: zIndexMap.dimensionOverlay,
+            }}
+            width={containerBounds.width}
+            height={containerBounds.height}
+          >
+            <rect
+              x={boundsScreenRect.left}
+              y={boundsScreenRect.top}
+              width={boundsScreenRect.width}
+              height={boundsScreenRect.height}
+              stroke="red"
+              strokeWidth={1.5}
+              strokeDasharray="4,3"
+              fill="rgba(255, 0, 0, 0.12)"
+            />
+          </svg>
+          <div
+            style={{
+              left: 0,
+              bottom: dimensionToolVisible ? 58 : 0,
+              position: "absolute",
+              color: "red",
+              fontFamily: "sans-serif",
+              fontSize: 12,
+              margin: 4,
+              pointerEvents: "none",
+              mixBlendMode: "difference",
+              zIndex: zIndexMap.dimensionOverlay,
+            }}
+          >
+            minX: {selectedBounds.minX.toFixed(2)}, minY:{" "}
+            {selectedBounds.minY.toFixed(2)}
+            <br />
+            maxX: {selectedBounds.maxX.toFixed(2)}, maxY:{" "}
+            {selectedBounds.maxY.toFixed(2)}
+          </div>
+        </>
+      )}
+      {dimensionToolVisible && (
+        <>
+          {diagonalLabel.show && (
+            <div
+              style={{
+                position: "absolute",
+                left: diagonalLabel.x,
+                top: diagonalLabel.y,
+                color: "red",
+                mixBlendMode: "difference",
+                pointerEvents: "none",
+                fontSize: 12,
+                fontFamily: "sans-serif",
+                whiteSpace: "nowrap",
+                zIndex: zIndexMap.dimensionOverlay,
+              }}
+            >
+              {diagonalLabel.distance.toFixed(2)}
+            </div>
+          )}
+
+          <div
+            style={{
+              position: "absolute",
+              left: arrowScreenBounds.left,
+              width: arrowScreenBounds.width,
+              textAlign: "center",
+              top: screenDStart.y + 2,
+              color: "red",
+              mixBlendMode: "difference",
+              pointerEvents: "none",
+              marginTop: arrowScreenBounds.flipY ? 0 : -20,
+              fontSize: 12,
+              fontFamily: "sans-serif",
+              zIndex: zIndexMap.dimensionOverlay,
+            }}
+          >
+            {Math.abs(dStart.x - dEnd.x).toFixed(2)}
+          </div>
+
+          <div
+            style={{
+              position: "absolute",
+              left: screenDEnd.x,
+              height: arrowScreenBounds.height,
+              display: "flex",
+              flexDirection: "column",
+              justifyContent: "center",
+              top: arrowScreenBounds.top,
+              color: "red",
+              pointerEvents: "none",
+              mixBlendMode: "difference",
+              fontSize: 12,
+              fontFamily: "sans-serif",
+              zIndex: zIndexMap.dimensionOverlay,
+            }}
+          >
+            <div
+              style={{
+                marginLeft: arrowScreenBounds.flipX ? "-100%" : 4,
+                paddingRight: 4,
+              }}
+            >
+              {Math.abs(dStart.y - dEnd.y).toFixed(2)}
+            </div>
+          </div>
+          {/* biome-ignore lint/a11y/noSvgWithoutTitle: <explanation> */}
+          <svg
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 0,
+              pointerEvents: "none",
+              mixBlendMode: "difference",
+              zIndex: zIndexMap.dimensionOverlay,
+            }}
+            width={containerBounds.width}
+            height={containerBounds.height}
+          >
+            <defs>
+              <marker
+                id="head"
+                orient="auto"
+                markerWidth="3"
+                markerHeight="4"
+                refX="2"
+                refY="2"
+              >
+                <path d="M0,0 V4 L2,2 Z" fill="red" />
+              </marker>
+            </defs>
+            <line
+              x1={screenDStart.x}
+              y1={screenDStart.y}
+              x2={screenDEnd.x}
+              y2={screenDEnd.y}
+              markerEnd="url(#head)"
+              strokeWidth={1.5}
+              fill="none"
+              stroke="red"
+            />
+            <line
+              x1={screenDStart.x}
+              y1={screenDStart.y}
+              x2={screenDEnd.x}
+              y2={screenDStart.y}
+              strokeWidth={1.5}
+              fill="none"
+              strokeDasharray={"2,2"}
+              stroke="red"
+            />
+            <line
+              x1={screenDEnd.x}
+              y1={screenDStart.y}
+              x2={screenDEnd.x}
+              y2={screenDEnd.y}
+              strokeWidth={1.5}
+              fill="none"
+              strokeDasharray={"2,2"}
+              stroke="red"
+            />
+          </svg>
+          {dimensionToolStretching &&
+            snappingPointsWithScreen.map((snap) => {
+              const isActive =
+                snap.id === activeSnapIds.start || snap.id === activeSnapIds.end
+              const half = SNAP_MARKER_SIZE / 2
+              return (
+                <svg
+                  key={snap.id}
+                  width={SNAP_MARKER_SIZE}
+                  height={SNAP_MARKER_SIZE}
+                  style={{
+                    position: "absolute",
+                    left: snap.screenPoint.x - half,
+                    top: snap.screenPoint.y - half,
+                    pointerEvents: "none",
+                    zIndex: zIndexMap.dimensionOverlay,
+                  }}
+                >
+                  <line
+                    x1={0}
+                    y1={0}
+                    x2={SNAP_MARKER_SIZE}
+                    y2={SNAP_MARKER_SIZE}
+                    stroke={isActive ? "#66ccff" : "white"}
+                    strokeWidth={1}
+                  />
+                  <line
+                    x1={SNAP_MARKER_SIZE}
+                    y1={0}
+                    x2={0}
+                    y2={SNAP_MARKER_SIZE}
+                    stroke={isActive ? "#66ccff" : "white"}
+                    strokeWidth={1}
+                  />
+                </svg>
+              )
+            })}
+          <div
+            style={{
+              right: 0,
+              bottom: 0,
+              position: "absolute",
+              color: "red",
+              fontFamily: "sans-serif",
+              fontSize: 12,
+              margin: 4,
+            }}
+          >
+            ({dStart.x.toFixed(2)},{dStart.y.toFixed(2)})<br />(
+            {dEnd.x.toFixed(2)},{dEnd.y.toFixed(2)})<br />
+            dist:{" "}
+            {Math.sqrt(
+              (dEnd.x - dStart.x) ** 2 + (dEnd.y - dStart.y) ** 2,
+            ).toFixed(2)}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
